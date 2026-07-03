@@ -1,16 +1,5 @@
 # ETM-Deconv
 
-Cellular deconvolution of bulk RNA-seq with an embedded topic model.
-
-Given a bulk tissue sample — a mixture of many cell types in unknown proportions —
-ETM-Deconv infers (i) the **cell-type proportions** and (ii) the **per-sample,
-per-cell-type gene expression profiles (GEPs)**. It adapts scETM (single-cell
-Embedded Topic Model) to the mixture setting: cell types are described as mixtures
-of a few co-expression **topics**, and each sample is a convex (simplex) mixture of
-the cell-type profiles. Because the mixture is taken on the simplex, the inferred
-proportions are exactly the transcript fractions of each cell type — directly
-interpretable and comparable to methods such as BayesPrism.
-
 ## Result
 
 On a strict cross-dataset benchmark (training and validation on disjoint datasets),
@@ -20,23 +9,6 @@ ETM-Deconv outperforms BayesPrism on proportions and stays competitive on profil
 |-------------|-------------------------|-----------------|
 | ETM-Deconv  | **0.959**               | 0.824           |
 | BayesPrism  | 0.873                   | 0.870           |
-
-## Method
-
-scETM places genes and topics in a shared embedding space (`rho`, `alpha`) and
-learns per-batch technical offsets (`lambda`) from a single-cell atlas. On top of
-that frozen basis, ETM-Deconv adds a per-cell-type topic recipe `M` and a
-per-sample topic perturbation `dM`. A cell type's profile is
-
-```
-beta_k = softmax( softmax(M[:,k] + dM_k) @ alpha @ rho + lambda )
-```
-
-and the sample is the convex combination `r = sum_k theta_k * beta_k`. The
-likelihood is Multinomial and the model is a semi-supervised VAE trained by
-amortised variational inference. Restricting the per-sample variation `dM` to the
-low-dimensional topic space is what keeps the profiles biologically structured and
-the problem identifiable.
 
 ## Pipeline
 
@@ -87,7 +59,4 @@ python phase3_deconvolve.py \
     --output_dir ./phase3
 ```
 
-## Report
 
-The full write-up — model derivation, loss, ablations and results — is in the
-accompanying report.
