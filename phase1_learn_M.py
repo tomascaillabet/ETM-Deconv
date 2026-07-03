@@ -198,7 +198,7 @@ def main():
         log.info("Init M from Phase-0 learned M (M_phase0.npy)")
     else:
         M_seed = seed_M_from_profiles(p0["profiles"])
-    model = ETMDeconvC2(p0["alpha"], p0["rho"], p0["lambda"], M_seed, sce2tm=p0.get("sce2tm", False), tau=p0.get("tau", 0.2), gene_baseline=p0.get("gene_baseline"), topic_gene_override=p0.get("topic_gene_override")).to(device)
+    model = ETMDeconvC2(p0["alpha"], p0["rho"], p0["lambda"], M_seed).to(device)
     for name, pa in model.named_parameters():
         pa.requires_grad = (name == "M")
 

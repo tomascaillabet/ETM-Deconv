@@ -57,32 +57,11 @@ def load_phase0(phase0_dir: str) -> dict:
         assert M_phase0.shape == (T, K), f"M_phase0 {M_phase0.shape} != ({T},{K})"
         log.info("Phase-0 learned M found (M_phase0.npy) — use it to init M")
 
-    sce2tm = bool(config.get("sce2tm_decoder", False))
-    tau = float(config.get("tau", 0.2))
-    if not sce2tm and (d / "scetm_full_state.pt").exists():
-        import torch as _t
-        st = _t.load(d / "scetm_full_state.pt", map_location="cpu", weights_only=True)
-        sce2tm = "decoder_bn.running_mean" in st
-    gene_baseline = None
-    topic_gene_override = None
-    if (d / "topic_gene_override.npy").exists():
-        topic_gene_override = np.load(d / "topic_gene_override.npy")
-        sce2tm = True
-        log.info(f"topic_gene_override loaded {topic_gene_override.shape} (scE2TM library B)")
-    if sce2tm:
-        gbp = d / "gene_log_baseline.npy"
-        if gbp.exists():
-            gene_baseline = np.load(gbp)
-            log.info(f"scE2TM decoder: B (tau={tau}) + gene_log_baseline")
-        else:
-            log.warning("scE2TM phase0 but gene_log_baseline.npy missing — GEP will be flat!")
-
     return {
         "alpha": alpha, "rho": rho, "lambda": lam, "profiles": profiles,
         "M_phase0": M_phase0,
         "genes": genes, "batches": batches, "types": types, "config": config,
         "T": T, "L": L, "V": V, "K": K, "S": S,
-        "sce2tm": sce2tm, "tau": tau, "gene_baseline": gene_baseline, "topic_gene_override": topic_gene_override,
     }
 
 
@@ -125,9 +104,7 @@ class ETMDeconvC2(nn.Module):
     """
 
     def __init__(self, alpha, rho, lambda_batch, M_init,
-                 sigma_init: float = 0.3,
-                 sce2tm: bool = False, tau: float = 0.2,
-                 gene_baseline=None, topic_gene_override=None):
+                 sigma_init: float = 0.3):
         super().__init__()
         self.register_buffer("alpha", torch.as_tensor(alpha, dtype=torch.float32))
         self.register_buffer("rho", torch.as_tensor(rho, dtype=torch.float32))
@@ -142,43 +119,11 @@ class ETMDeconvC2(nn.Module):
             torch.full((self.K,), float(np.log(sigma_init)), dtype=torch.float32)
         )
 
-        self._sce2tm = bool(sce2tm)
-        self._tau = float(tau)
-        with torch.no_grad():
-            if topic_gene_override is not None:
-                B = torch.as_tensor(topic_gene_override, dtype=torch.float32)
-                assert B.shape == (self.T, self.V), f"override {tuple(B.shape)} != ({self.T},{self.V})"
-                self._sce2tm = True
-            elif self._sce2tm:
-                an = F.normalize(self.alpha, dim=1)
-                gn = F.normalize(self.rho.t(), dim=1)
-                B = F.softmax(-(2.0 - 2.0 * (an @ gn.t())) / self._tau, dim=0)
-            else:
-                B = self.alpha @ self.rho
-            self.register_buffer("topic_gene", B)
-        gb = torch.zeros(self.V) if gene_baseline is None else torch.as_tensor(gene_baseline, dtype=torch.float32)
-        self.register_buffer("gene_baseline", gb)
-
-        with torch.no_grad():
-            if self._sce2tm:
-                c0 = F.softmax(self.M.t(), dim=-1)
-                cB0 = c0 @ self.topic_gene
-                g_mean = cB0.mean(0)
-                g_std = cB0.std(0)
-                g_std = g_std.clamp(min=float(g_std.median()) * 0.3 + 1e-8)
-            else:
-                g_mean = torch.zeros(self.V); g_std = torch.ones(self.V)
-        self.register_buffer("tg_mean", g_mean)
-        self.register_buffer("tg_std", g_std)
+        self.register_buffer("topic_gene", self.alpha @ self.rho)
 
     def _gene_logits(self, c: torch.Tensor) -> torch.Tensor:
-        """c (..., T) -> per-gene logits (..., V). For scE2TM standardizes c@B per gene
-        (so the level-free B's tiny type signal is learnable) then adds the per-gene
-        expression baseline; for the dot-product decoder this is identity + 0."""
-        z = c @ self.topic_gene
-        if self._sce2tm:
-            z = (z - self.tg_mean) / self.tg_std + self.gene_baseline
-        return z
+        """c (..., T) -> per-gene logits (..., V) = c @ (alpha @ rho)."""
+        return c @ self.topic_gene
 
     @property
     def sigma_k(self) -> torch.Tensor:
@@ -257,8 +202,6 @@ class ETMDeconvC2(nn.Module):
         and a batch-specific technical part (lambda_s - mean). The biological GEP
         keeps the baseline and drops only the technical part.
         """
-        if self._sce2tm:
-            return torch.zeros(self.V, device=self.lambda_batch.device)
         return self.lambda_batch.mean(0)
 
     def beta_bio(self, dM: Optional[torch.Tensor] = None,
@@ -267,10 +210,9 @@ class ETMDeconvC2(nn.Module):
         """
         Batch-corrected biological per-state gene profiles:
             beta_bio_k = softmax(_gene_logits(softmax(M[:,k] + dM_k)) + bio_baseline).
-        Keeps the shared expression baseline (biology; carried by lambda_mean for the
-        dot-product decoder, or by the decoder BatchNorm for scE2TM), drops the
-        batch-specific technical part. use_baseline=False -> pure topic profile.
-        With dM=None and states=None returns the consensus profiles (K, V).
+        Keeps the shared expression baseline and drops the batch-specific technical
+        part. use_baseline=False -> pure topic profile. With dM=None and states=None
+        returns the consensus profiles (K, V).
         """
         M = self.M if states is None else self.M[:, states]
         c_logit = M.t() if dM is None else M.t() + dM

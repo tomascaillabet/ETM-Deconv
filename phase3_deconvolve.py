@@ -106,7 +106,7 @@ def main():
     log.info(f"Validation mixtures: {X.shape[0]} samples")
 
     M_seed = seed_M_from_profiles(p0["profiles"])
-    model = ETMDeconvC2(p0["alpha"], p0["rho"], p0["lambda"], M_seed, sce2tm=p0.get("sce2tm", False), tau=p0.get("tau", 0.2), gene_baseline=p0.get("gene_baseline"), topic_gene_override=p0.get("topic_gene_override")).to(device)
+    model = ETMDeconvC2(p0["alpha"], p0["rho"], p0["lambda"], M_seed).to(device)
     model.load_state_dict(torch.load(Path(args.phase2) / "c2_phase2.pt",
                                      map_location=device, weights_only=True))
     encoder = C2Encoder(V, K, T, hidden=args.hidden).to(device)

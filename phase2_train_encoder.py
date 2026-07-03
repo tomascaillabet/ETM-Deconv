@@ -223,7 +223,7 @@ def main():
     log.info(f"Pseudobulk: {X.shape[0]} mixtures | A={A} active slots")
 
     M_seed = seed_M_from_profiles(p0["profiles"])
-    model = ETMDeconvC2(p0["alpha"], p0["rho"], p0["lambda"], M_seed, sce2tm=p0.get("sce2tm", False), tau=p0.get("tau", 0.2), gene_baseline=p0.get("gene_baseline"), topic_gene_override=p0.get("topic_gene_override")).to(device)
+    model = ETMDeconvC2(p0["alpha"], p0["rho"], p0["lambda"], M_seed).to(device)
     state = torch.load(Path(cfg.phase1) / "c2_phase1.pt", map_location=device, weights_only=True)
     model.load_state_dict(state)
     log.info(f"Loaded Phase-1 M + sigma_k (sigma in [{model.sigma_k.min():.3f}, "

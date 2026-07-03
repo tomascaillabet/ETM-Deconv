@@ -12,11 +12,8 @@ Usage:
 import argparse
 import json
 import logging
-import math
-import os
 from dataclasses import dataclass, asdict
 from pathlib import Path
-from typing import Optional
 
 import numpy as np
 import pandas as pd
@@ -55,12 +52,6 @@ class Phase0Config:
     random_rho: bool = False
     learn_rho: bool = False
     w_rho_prior: float = 0.0
-    w_ecr: float = 0.0
-    ecr_eps: float = 0.05
-    ecr_iters: int = 30
-    distance_decoder: bool = False
-    sce2tm_decoder: bool = False
-    tau: float = 1.0
     log_input: bool = True
     seed: int = 0
     patience: int = 30
@@ -179,7 +170,6 @@ class SCETM(nn.Module):
             self.register_buffer("rho", rho)
         self.alpha = nn.Parameter(torch.randn(T, L) * 0.01)
         self.lambda_batch = nn.Parameter(torch.zeros(n_batch, V))
-        self.decoder_bn = nn.BatchNorm1d(V, affine=False)
         self.encoder = TopicEncoder(V, T, hidden, dropout)
 
     def rho_prior_loss(self) -> torch.Tensor:
@@ -188,57 +178,13 @@ class SCETM(nn.Module):
             return torch.zeros((), device=self.alpha.device)
         return ((self.rho - self.rho_prior) ** 2).sum(0).mean()
 
-    def ecr_loss(self, eps: float = 0.05, n_iter: int = 30) -> torch.Tensor:
-        """
-        Embedding Clustering Regularization (Wu et al., ICML 2023) — anti topic-collapse.
-        Treats gene embeddings (columns of rho) as cluster SAMPLES and topic vectors
-        (rows of alpha) as cluster CENTERS, both in R^L. Solves an entropic OT problem
-        with a PRESET UNIFORM cluster-size constraint (each topic owns V/T genes) via
-        Sinkhorn, then L_ECR = <C, pi*>. The size constraint forbids empty clusters, so
-        topics are forced apart to cover distinct regions of gene-embedding space.
-        Embeddings are unit-normalised for the cost so C in [0,4] (eps=0.05 is stable).
-        The OT plan is detached (envelope theorem): gradient flows through C only.
-        """
-        g = self.rho.t()
-        t = self.alpha
-        g = g / (g.norm(dim=1, keepdim=True) + 1e-8)
-        t = t / (t.norm(dim=1, keepdim=True) + 1e-8)
-        C = torch.cdist(g, t).pow(2)
-        Vn, Tn = C.shape
-        log_mu = C.new_full((Vn,), -math.log(Vn))
-        log_nu = C.new_full((Tn,), -math.log(Tn))
-        with torch.no_grad():
-            f = C.new_zeros(Vn); gg = C.new_zeros(Tn)
-            for _ in range(n_iter):
-                f = eps * (log_mu - torch.logsumexp((gg[None, :] - C) / eps, dim=1))
-                gg = eps * (log_nu - torch.logsumexp((f[:, None] - C) / eps, dim=0))
-            pi = torch.exp((f[:, None] + gg[None, :] - C) / eps)
-        return (C * pi).sum()
-
     def topic_gene_logits(self) -> torch.Tensor:
-        """
-        beta logits per topic: (T, V). Default = alpha @ rho (dot-product). With the
-        distance decoder (ECRTM geometry), each topic-gene logit is the NEGATIVE
-        squared distance between topic vector alpha_t and gene embedding rho_j, scaled
-        by tau. softmax over GENES is applied downstream (preserves C2's per-topic =
-        gene-distribution structure, unlike ECRTM's over-topic normalization).
-        """
-        if getattr(self, "_sce2tm_decoder", False):
-            a = F.normalize(self.alpha, dim=1)
-            g = F.normalize(self.rho.t(), dim=1)
-            d2 = 2.0 - 2.0 * (a @ g.t())
-            return F.softmax(-d2 / self._tau, dim=0)
-        if getattr(self, "_distance_decoder", False):
-            a2 = (self.alpha ** 2).sum(1, keepdim=True)
-            r2 = (self.rho ** 2).sum(0, keepdim=True)
-            cross = self.alpha @ self.rho
-            d2 = a2 + r2 - 2.0 * cross
-            return -d2 / self._tau
+        """beta logits per topic: (T, V) = alpha @ rho (dot-product)."""
         return self.alpha @ self.rho
 
     def decode(self, psi: torch.Tensor, batch_idx: torch.Tensor) -> torch.Tensor:
         """
-        r_c = softmax(psi @ B + lambda_s), B = topic-gene logits (dot-product or distance).
+        r_c = softmax(psi @ alpha @ rho + lambda_s).
 
         Args:
             psi:       (B, T) topic loadings (simplex)
@@ -246,14 +192,8 @@ class SCETM(nn.Module):
         Returns:
             r: (B, V) predicted gene proportions
         """
-        if getattr(self, "_sce2tm_decoder", False):
-            beta = self.topic_gene_logits()
-            logits = self.decoder_bn(psi @ beta)
-        elif getattr(self, "_distance_decoder", False):
-            logits = psi @ self.topic_gene_logits()
-        else:
-            topic_mix = psi @ self.alpha
-            logits = topic_mix @ self.rho
+        topic_mix = psi @ self.alpha
+        logits = topic_mix @ self.rho
         logits = logits + self.lam()[batch_idx]
         return F.softmax(logits, dim=-1)
 
@@ -332,7 +272,7 @@ def train(model: SCETM, loader: DataLoader, cfg: Phase0Config,
     model.train()
     for epoch in range(cfg.epochs):
         beta = cfg.kl_weight * kl_warmup(epoch, cfg.epochs, cfg.warmup_frac)
-        tot_loss = tot_recon = tot_kl = tot_ecr = 0.0
+        tot_loss = tot_recon = tot_kl = 0.0
         n_batches = 0
         for batch in loader:
             X = batch["X"].to(device)
@@ -340,10 +280,6 @@ def train(model: SCETM, loader: DataLoader, cfg: Phase0Config,
             opt.zero_grad()
             out = model(X, bidx, beta_kl=beta, normalize_kl=cfg.normalize_kl)
             loss = out["loss"] + model._w_rho_prior * model.rho_prior_loss()
-            if model._w_ecr > 0:
-                ecr = model.ecr_loss(eps=model._ecr_eps, n_iter=model._ecr_iters)
-                loss = loss + model._w_ecr * ecr
-                tot_ecr += ecr.item()
             loss.backward()
             torch.nn.utils.clip_grad_norm_(model.parameters(), 5.0)
             opt.step()
@@ -367,12 +303,6 @@ def train(model: SCETM, loader: DataLoader, cfg: Phase0Config,
             extra = ""
             if model._learn_rho:
                 extra = f" | rho_drift={model.rho_prior_loss().item():.4f}"
-            if model._w_ecr > 0:
-                tg = model.topic_gene_logits().detach()
-                tg = tg - tg.mean(0, keepdim=True)
-                sv = torch.linalg.svdvals(tg)
-                erank = (sv.sum() ** 2 / (sv ** 2).sum()).item()
-                extra += f" | ecr={tot_ecr/max(n_batches,1):.4f} | eff_rank={erank:.1f}"
             log.info(
                 f"Epoch {epoch:4d}/{cfg.epochs} | loss={avg_loss:.4f} "
                 f"| recon={rec['recon']:.4f} | kl={rec['kl']:.4f} | beta={beta:.3f}{extra}"
@@ -572,15 +502,6 @@ def main():
     p.add_argument("--random_rho", action="store_true", help="Random rho init (scETM: learn embeddings from scratch).")
     p.add_argument("--learn_rho", action="store_true", help="Make rho trainable (anchored to its init).")
     p.add_argument("--w_rho_prior", type=float, default=0.0, help="Weight on ||rho - rho_prior||^2 (per-gene).")
-    p.add_argument("--w_ecr", type=float, default=0.0,
-                   help="Weight on Embedding Clustering Regularization (anti topic-collapse). 0=off.")
-    p.add_argument("--ecr_eps", type=float, default=0.05, help="Sinkhorn entropic reg for ECR.")
-    p.add_argument("--ecr_iters", type=int, default=30, help="Sinkhorn iterations for ECR.")
-    p.add_argument("--distance_decoder", action="store_true",
-                   help="Raw-distance geometry: topic-gene logits = -||alpha_t - rho_j||^2/tau (softmax over genes).")
-    p.add_argument("--sce2tm_decoder", action="store_true",
-                   help="scE2TM decoder: normalized embeddings, beta=softmax_topics(-dist/tau), BatchNorm, softmax over genes.")
-    p.add_argument("--tau", type=float, default=1.0, help="Temperature (beta_temp) for the distance/sce2tm decoder.")
     p.add_argument("--no_log_input", action="store_true",
                    help="Disable log1p normalisation of encoder input.")
     p.add_argument("--seed", type=int, default=0)
@@ -597,8 +518,6 @@ def main():
         no_lambda=args.no_lambda, center_lambda=args.center_lambda,
         rho_path=args.rho_path, rho_genes=args.rho_genes, random_rho=args.random_rho,
         learn_rho=args.learn_rho, w_rho_prior=args.w_rho_prior,
-        w_ecr=args.w_ecr, ecr_eps=args.ecr_eps, ecr_iters=args.ecr_iters,
-        distance_decoder=args.distance_decoder, sce2tm_decoder=args.sce2tm_decoder, tau=args.tau,
         log_input=not args.no_log_input,
         seed=args.seed, patience=args.patience, output_dir=args.output_dir,
     )
@@ -674,19 +593,6 @@ def main():
         log.info(f"learn_rho: rho trainable, anchored via w_rho_prior={cfg.w_rho_prior}")
     model._log_input = cfg.log_input
     model._center_lambda = cfg.center_lambda
-    model._w_ecr = cfg.w_ecr
-    model._ecr_eps = cfg.ecr_eps
-    model._ecr_iters = cfg.ecr_iters
-    model._distance_decoder = cfg.distance_decoder
-    model._sce2tm_decoder = cfg.sce2tm_decoder
-    model._tau = cfg.tau
-    if cfg.distance_decoder:
-        log.info(f"distance_decoder: topic-gene logits = -||alpha_t - rho_j||^2 / tau (tau={cfg.tau})")
-    if cfg.sce2tm_decoder:
-        log.info(f"sce2tm_decoder: normalized embeddings, beta=softmax_topics(-dist/{cfg.tau}), BatchNorm + softmax_genes")
-    if cfg.w_ecr > 0:
-        log.info(f"ECR: anti-collapse on, w_ecr={cfg.w_ecr}, eps={cfg.ecr_eps}, "
-                 f"iters={cfg.ecr_iters} (preset uniform cluster size V/T={model.V/model.T:.0f})")
     if cfg.center_lambda:
         log.info("center_lambda: lambda mean-zero across batches (technical only); baseline -> alpha")
     if cfg.no_lambda:
